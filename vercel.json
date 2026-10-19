@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/api/check",
+      "destination": "/api/check.py"
+    },
+    {
+      "source": "/api/fleet",
+      "destination": "/api/fleet.py"
+    },
+    {
+      "source": "/api/upload-file",
+      "destination": "/api/upload.py"
+    },
+    {
+      "source": "/api/upload",
+      "destination": "/api/upload.py"
+    }
+  ]
+}
