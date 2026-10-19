@@ -11,3 +11,4 @@ config.toml
 # OS generated
 .DS_Store
 Thumbs.db
+.taste-skill/
