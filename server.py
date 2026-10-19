@@ -595,8 +595,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     .modal-overlay {
       position: fixed;
       inset: 0;
-      background: rgba(0, 0, 0, 0.78);
-      backdrop-filter: blur(4px);
+      background: rgba(0, 0, 0, 0.85);
       z-index: 100;
       display: none;
       align-items: center;
@@ -609,11 +608,10 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     .modal-card {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 16px;
+      border-radius: 8px;
       width: 100%;
       max-width: 620px;
       padding: 24px;
-      box-shadow: 0 20px 40px rgba(0,0,0,0.85);
     }
     .modal-header {
       display: flex;

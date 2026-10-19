@@ -12,3 +12,5 @@ config.toml
 .DS_Store
 Thumbs.db
 .taste-skill/
+.agents/
+skills-lock.json
