@@ -136,6 +136,29 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(state)
             return
 
+        # 2b. API: Export Expired & Expiring Vehicles to PDF
+        if path == "/api/export-pdf":
+            try:
+                import export_pdf
+                success = export_pdf.generate_pdf()
+                pdf_path = export_pdf.LOCAL_PDF
+                if success and os.path.exists(pdf_path):
+                    with open(pdf_path, "rb") as f:
+                        content = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/pdf")
+                    self.send_header("Content-Disposition", 'attachment; filename="MOT_Expired_and_Expiring_Report.pdf"')
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
+                else:
+                    self.send_json({"error": "Failed to compile PDF report"}, 500)
+                    return
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+                return
+
         # 3. Static Logo
         if path == "/logo.svg":
             logo_path = os.path.join(BASE_DIR, "logo.svg")
@@ -851,6 +874,10 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         <img src="/logo.svg" alt="MOTPing" class="logo-img" />
       </div>
       <div class="header-actions">
+        <a href="/api/export-pdf" download="MOT_Expired_and_Expiring_Report.pdf" class="btn btn-secondary btn-sm" style="border-color: #ef4444; color: #fca5a5; text-decoration: none;">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export Expired & Expiring (PDF)
+        </a>
         <button class="btn btn-secondary btn-sm" onclick="syncExcel()">Sync Excel Log</button>
         <button class="btn btn-secondary btn-sm" onclick="openBulkModal()">Paste Bulk Plates</button>
         <button class="btn btn-primary btn-sm" id="btnScanAll" onclick="scanAllLive()">Scan All Expiries</button>
