@@ -1287,7 +1287,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         const res = await fetch('/api/import-excel', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ path: path.replace(/\\\\/g, '\\') })
+          body: JSON.stringify({ path: path })
         });
         const data = await res.json();
         if (data.success) {
