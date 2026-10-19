@@ -23,11 +23,23 @@ from mot_engine import query_dvla_vehicle
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "mot_fleet_state.json")
 
-def parse_vehicles_from_excel(path):
-    if not os.path.exists(path):
-        return []
+import io
+
+def parse_vehicles_from_excel(source):
+    """
+    Parses vehicles from an excel file path or raw bytes/BytesIO.
+    Extracts VRN and associated vehicle specification / driver notes.
+    """
     try:
-        with zipfile.ZipFile(path, 'r') as z:
+        file_obj = source
+        if isinstance(source, str):
+            if not os.path.exists(source):
+                return []
+            file_obj = source
+        elif isinstance(source, bytes):
+            file_obj = io.BytesIO(source)
+
+        with zipfile.ZipFile(file_obj, 'r') as z:
             shared = []
             if 'xl/sharedStrings.xml' in z.namelist():
                 tree = ET.fromstring(z.read('xl/sharedStrings.xml'))
@@ -35,7 +47,13 @@ def parse_vehicles_from_excel(path):
                     t = si.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t')
                     shared.append(t.text if t is not None and t.text else '')
 
-            tree = ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
+            sheet_names = [f for f in z.namelist() if f.startswith('xl/worksheets/sheet') and f.endswith('.xml')]
+            if not sheet_names:
+                return []
+            
+            # Default to first sheet (e.g. sheet1.xml)
+            sheet_target = 'xl/worksheets/sheet1.xml' if 'xl/worksheets/sheet1.xml' in sheet_names else sheet_names[0]
+            tree = ET.fromstring(z.read(sheet_target))
             rows = tree.findall('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheetData/{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row')
             
             seen = set()
@@ -52,13 +70,14 @@ def parse_vehicles_from_excel(path):
                         val = shared[int(v.text)] if t == 's' else v.text
                     cells[col] = val.strip()
                 vehicle = cells.get('A', '')
-                reg = cells.get('B', '').replace(' ', '').upper()
+                raw_reg = cells.get('B', '')
+                reg = re.sub(r'[^A-Za-z0-9]', '', raw_reg).upper()
                 driver = cells.get('F', '')
                 comment = cells.get('K', '')
                 if reg and len(reg) >= 4 and not reg.startswith('REG') and reg not in seen:
                     seen.add(reg)
                     notes_parts = [p for p in [vehicle, driver, comment] if p]
-                    vehicles.append({'vrn': reg, 'notes': ' | '.join(notes_parts), 'last_check': None})
+                    vehicles.append({'vrn': reg, 'notes': ' | '.join(notes_parts), 'last_check': None, 'booked': False})
             return vehicles
     except Exception as e:
         print(f"Error parsing excel: {e}")
@@ -219,6 +238,78 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error": str(e)}, 500)
             return
 
+        # 3. Direct Drag & Drop File Upload (.xlsx, .csv, .txt)
+        if path == "/api/upload-file":
+            length = int(self.headers.get('Content-Length', 0))
+            raw_bytes = self.rfile.read(length)
+            try:
+                extracted = []
+                # Check if Excel XLSX (PK zip header)
+                if raw_bytes.startswith(b"PK\x03\x04"):
+                    extracted = parse_vehicles_from_excel(raw_bytes)
+                else:
+                    # Treat as plaintext / CSV
+                    text = raw_bytes.decode('utf-8', errors='ignore')
+                    lines = text.splitlines()
+                    seen = set()
+                    plate_pat = re.compile(r'([A-Za-z]{1,3}[0-9]{1,4}[A-Za-z]{0,3}|[A-Za-z]{2}[0-9]{2}\s?[A-Za-z]{3})', re.I)
+                    for line in lines:
+                        match = plate_pat.search(line)
+                        if match:
+                            raw_vrn = re.sub(r'[^A-Za-z0-9]', '', match.group(0)).upper()
+                            if raw_vrn and len(raw_vrn) >= 4 and raw_vrn not in seen:
+                                seen.add(raw_vrn)
+                                notes = line.replace(match.group(0), '').strip(' ,\t-|')
+                                extracted.append({'vrn': raw_vrn, 'notes': notes, 'last_check': None, 'booked': False})
+
+                state = load_fleet_state()
+                existing_map = {v["vrn"]: v for v in state.get("vehicles", [])}
+                added = 0
+                for item in extracted:
+                    vrn = item["vrn"]
+                    if vrn in existing_map:
+                        if item.get("notes"):
+                            existing_map[vrn]["notes"] = item["notes"]
+                    else:
+                        state.setdefault("vehicles", []).append(item)
+                        existing_map[vrn] = item
+                        added += 1
+
+                save_fleet_state(state)
+                self.send_json({
+                    "success": True,
+                    "parsed": len(extracted),
+                    "added": added,
+                    "total": len(state.get("vehicles", []))
+                })
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+            return
+
+        # 4. Toggle or Update 'Booked' MOT Expiry Status
+        if path == "/api/vehicles/book":
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length).decode('utf-8')
+            try:
+                data = json.loads(body)
+                vrn = re.sub(r'[^A-Za-z0-9]', '', data.get("vrn", "")).upper()
+                booked = bool(data.get("booked", True))
+                booking_ref = data.get("booking_ref", "Booked")
+
+                state = load_fleet_state()
+                matched = [v for v in state.get("vehicles", []) if v["vrn"] == vrn]
+                if not matched:
+                    self.send_json({"error": "Vehicle not found in fleet"}, 404)
+                    return
+
+                matched[0]["booked"] = booked
+                matched[0]["booking_ref"] = booking_ref
+                save_fleet_state(state)
+                self.send_json({"success": True, "vrn": vrn, "booked": booked, "booking_ref": booking_ref})
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -256,12 +347,13 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
-      --ground: #000000;
-      --surface: #0e0f11;
-      --raised: #18191c;
-      --border: #222429;
-      --rule: #17181c;
-      --control: #383a42;
+      --ground: #121214;
+      --surface: #1a1a1c;
+      --raised: #222226;
+      --header-bg: #262626;
+      --border: #2e2e33;
+      --rule: #232327;
+      --control: #3f3f46;
       --text: #ffffff;
       --muted: #a1a1aa;
       --faint: #71717a;
@@ -270,6 +362,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       --positive: #10b981;
       --negative: #ef4444;
       --warning: #f59e0b;
+      --booked: #38bdf8;
       
       --pill-pos-bg: #064e3b;
       --pill-pos-ink: #34d399;
@@ -277,7 +370,9 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       --pill-neg-ink: #f87171;
       --pill-warn-bg: #451a03;
       --pill-warn-ink: #fbbf24;
-      --pill-neutral-bg: #18191c;
+      --pill-booked-bg: #0c4a6e;
+      --pill-booked-ink: #38bdf8;
+      --pill-neutral-bg: #27272a;
       --pill-neutral-ink: #a1a1aa;
 
       --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -296,21 +391,21 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
 
     .num { font-variant-numeric: tabular-nums; }
 
-    /* Shell Layout */
-    .shell {
+    /* Top Navigation Bar: #262626 Grey Themed */
+    .topbar-container {
+      background: var(--header-bg);
+      border-bottom: 1px solid #333333;
+      padding: 16px 0;
+      margin-bottom: 28px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    }
+    .topbar-content {
       max-width: 1280px;
       margin: 0 auto;
-      padding: 32px 24px 64px;
-    }
-
-    /* Top Navigation Bar */
-    .topbar {
+      padding: 0 24px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding-bottom: 24px;
-      border-bottom: 1px solid var(--rule);
-      margin-bottom: 28px;
     }
     .brand-wrap {
       display: flex;
@@ -318,13 +413,21 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       gap: 16px;
     }
     .logo-img {
-      height: 38px;
+      height: 52px;
       width: auto;
+      display: block;
     }
     .header-actions {
       display: flex;
       align-items: center;
       gap: 10px;
+    }
+
+    /* Shell Layout */
+    .shell {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 0 24px 64px;
     }
 
     /* KPI Summary Strip */
@@ -333,12 +436,12 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       grid-template-columns: repeat(4, 1fr);
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      margin-bottom: 28px;
+      border-radius: 8px;
+      margin-bottom: 24px;
       overflow: hidden;
     }
     .kpi-cell {
-      padding: 20px 24px;
+      padding: 18px 22px;
     }
     .kpi-cell + .kpi-cell {
       border-left: 1px solid var(--border);
@@ -351,8 +454,8 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       text-transform: uppercase;
     }
     .kpi-value {
-      font-size: 28px;
-      font-weight: 600;
+      font-size: 26px;
+      font-weight: 700;
       line-height: 1.2;
       margin-top: 6px;
       font-variant-numeric: tabular-nums;
@@ -370,9 +473,9 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     .panel {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: 8px;
       padding: 20px 24px;
-      margin-bottom: 28px;
+      margin-bottom: 24px;
     }
     .panel-header {
       display: flex;
@@ -390,6 +493,32 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       color: var(--muted);
     }
 
+    /* Drop Zone Panel */
+    .drop-zone {
+      border: 2px dashed #3f3f46;
+      background: #17171a;
+      border-radius: 8px;
+      padding: 22px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      margin-bottom: 24px;
+    }
+    .drop-zone:hover, .drop-zone.dragover {
+      border-color: #38bdf8;
+      background: rgba(56, 189, 248, 0.04);
+    }
+    .drop-zone-text {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .drop-zone-sub {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+
     /* Form Controls */
     .intake-row {
       display: grid;
@@ -399,7 +528,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     .input {
       background: var(--ground);
       border: 1px solid var(--control);
-      border-radius: 8px;
+      border-radius: 6px;
       padding: 10px 14px;
       color: var(--text);
       font-family: var(--font);
@@ -416,12 +545,12 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       font-weight: 800;
       text-transform: uppercase;
       letter-spacing: 1.5px;
-      background: #fef08a;
+      background: #facc15;
       color: #0f172a;
       border: 1px solid #ca8a04;
     }
     .input-plate::placeholder {
-      color: #854d0e;
+      color: #713f12;
       font-weight: 500;
     }
     .btn {
@@ -429,9 +558,9 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       align-items: center;
       justify-content: center;
       gap: 8px;
-      height: 40px;
+      height: 38px;
       padding: 0 16px;
-      border-radius: 8px;
+      border-radius: 6px;
       font-family: var(--font);
       font-size: 13px;
       font-weight: 600;
@@ -453,13 +582,13 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       border-color: var(--border);
     }
     .btn-secondary:hover {
-      background: #27272a;
+      background: #2a2a30;
     }
     .btn-sm {
       height: 28px;
       padding: 0 10px;
       font-size: 12px;
-      border-radius: 6px;
+      border-radius: 5px;
     }
     .btn-danger {
       background: transparent;
@@ -468,6 +597,14 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     }
     .btn-danger:hover {
       background: #450a0a;
+    }
+    .btn-booked {
+      background: rgba(56, 189, 248, 0.1);
+      color: #38bdf8;
+      border-color: rgba(56, 189, 248, 0.3);
+    }
+    .btn-booked:hover {
+      background: rgba(56, 189, 248, 0.2);
     }
 
     /* List Filter Toolbar */
@@ -486,7 +623,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     .table-card {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: 8px;
       overflow: hidden;
     }
     table {
@@ -495,7 +632,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       text-align: left;
     }
     th {
-      background: #090a0c;
+      background: #141416;
       padding: 12px 18px;
       font-size: 11px;
       font-weight: 600;
@@ -515,7 +652,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       border-bottom: none;
     }
     tr:hover td {
-      background: rgba(255, 255, 255, 0.015);
+      background: rgba(255, 255, 255, 0.02);
     }
 
     /* Clean Yellow Number Plate Badge (NO GB) */
@@ -532,7 +669,6 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       padding: 3px 10px;
       border-radius: 4px;
       border: 1px solid #ca8a04;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.35);
       text-transform: uppercase;
     }
 
@@ -565,6 +701,10 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       background: var(--pill-warn-bg);
       color: var(--pill-warn-ink);
     }
+    .pill-booked {
+      background: var(--pill-booked-bg);
+      color: var(--pill-booked-ink);
+    }
     .pill-neutral {
       background: var(--pill-neutral-bg);
       color: var(--pill-neutral-ink);
@@ -588,7 +728,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       display: flex;
       align-items: center;
       justify-content: flex-end;
-      gap: 8px;
+      gap: 6px;
     }
 
     /* Modal / Detail Drawer & Bulk Import */
@@ -630,7 +770,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     .spec-item {
       background: var(--ground);
       border: 1px solid var(--rule);
-      border-radius: 8px;
+      border-radius: 6px;
       padding: 12px;
     }
     .spec-item-label {
@@ -651,7 +791,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       height: 180px;
       background: var(--ground);
       border: 1px solid var(--control);
-      border-radius: 8px;
+      border-radius: 6px;
       padding: 12px;
       color: var(--text);
       font-family: var(--mono);
@@ -704,9 +844,9 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
   </style>
 </head>
 <body>
-  <div class="shell">
-    <!-- Topbar Navigation -->
-    <header class="topbar">
+  <!-- Header: #262626 Grey Themed -->
+  <header class="topbar-container">
+    <div class="topbar-content">
       <div class="brand-wrap">
         <img src="/logo.svg" alt="MOTPing" class="logo-img" />
       </div>
@@ -715,7 +855,16 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         <button class="btn btn-secondary btn-sm" onclick="openBulkModal()">Paste Bulk Plates</button>
         <button class="btn btn-primary btn-sm" id="btnScanAll" onclick="scanAllLive()">Scan All Expiries</button>
       </div>
-    </header>
+    </div>
+  </header>
+
+  <div class="shell">
+    <!-- Drag & Drop Zone -->
+    <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+      <input type="file" id="fileInput" style="display: none;" accept=".xlsx,.csv,.txt" onchange="handleFileSelect(event)" />
+      <div class="drop-zone-text">Drag & Drop Excel or Fleet Logs Here</div>
+      <div class="drop-zone-sub">Drop <code>Vehicles log 19.xlsx</code>, CSV, or text files to automatically intake and track plates</div>
+    </div>
 
     <!-- KPI Metric Strip -->
     <section class="kpi-strip">
@@ -725,7 +874,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         <div class="kpi-sub">Active fleet intake</div>
       </div>
       <div class="kpi-cell">
-        <div class="kpi-label">MOT Valid</div>
+        <div class="kpi-label">MOT Valid / Legal</div>
         <div class="kpi-value" style="color: #34d399;" id="kpiValid">0 <small>road legal</small></div>
         <div class="kpi-sub">Valid test certificates</div>
       </div>
@@ -737,7 +886,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       <div class="kpi-cell">
         <div class="kpi-label">Expired / Attention</div>
         <div class="kpi-value" style="color: #f87171;" id="kpiExpired">0 <small>overdue</small></div>
-        <div class="kpi-sub">Unroadworthy or lapsed</div>
+        <div class="kpi-sub">Lapsed (or Booked)</div>
       </div>
     </section>
 
@@ -752,12 +901,12 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       </div>
     </div>
 
-    <!-- Plate Intake Panel -->
+    <!-- Quick Single Plate Intake Panel -->
     <section class="panel">
       <div class="panel-header">
         <div>
           <h2 class="panel-title">Add Vehicle to Watchlist</h2>
-          <p class="panel-desc">Automatic query against DVLA vehicle & test certificate records.</p>
+          <p class="panel-desc">Quick single VRN query against DVLA vehicle & test certificate records.</p>
         </div>
       </div>
       <form class="intake-row" onsubmit="addVehicle(event)">
@@ -804,7 +953,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       <div class="modal-header">
         <div>
           <h3 style="font-size: 17px; font-weight: 600;">Paste Vehicle List</h3>
-          <p style="font-size: 13px; color: var(--muted); margin-top: 4px;">Paste raw registration plates or lines with notes (e.g. from Excel, CSV, or WhatsApp).</p>
+          <p style="font-size: 13px; color: var(--muted); margin-top: 4px;">Paste raw registration plates or lines with notes.</p>
         </div>
         <button class="btn btn-secondary btn-sm" onclick="closeBulkModal()">✕</button>
       </div>
@@ -874,12 +1023,56 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     let telemetryCache = {};
     let isScanningAll = false;
 
+    // Drag and Drop Listeners
+    const dropZone = document.getElementById('dropZone');
+    ['dragenter', 'dragover'].forEach(eventName => {
+      dropZone.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        dropZone.classList.add('dragover');
+      }, false);
+    });
+    ['dragleave', 'drop'].forEach(eventName => {
+      dropZone.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('dragover');
+      }, false);
+    });
+    dropZone.addEventListener('drop', (e) => {
+      const files = e.dataTransfer.files;
+      if (files.length > 0) uploadDroppedFile(files[0]);
+    });
+
+    function handleFileSelect(e) {
+      if (e.target.files.length > 0) uploadDroppedFile(e.target.files[0]);
+    }
+
+    async function uploadDroppedFile(file) {
+      dropZone.querySelector('.drop-zone-text').textContent = `Importing ${file.name}...`;
+      try {
+        const res = await fetch('/api/upload-file', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/octet-stream'},
+          body: file
+        });
+        const data = await res.json();
+        if (data.success) {
+          alert(`Successfully imported ${file.name}!\nFound: ${data.parsed} vehicles\nNew additions: ${data.added}\nTotal in Fleet: ${data.total}`);
+          loadFleet();
+        } else {
+          alert('Import failed: ' + (data.error || 'Unknown error'));
+        }
+      } catch (err) {
+        alert('File upload error: ' + err);
+      } finally {
+        dropZone.querySelector('.drop-zone-text').textContent = 'Drag & Drop Excel or Fleet Logs Here';
+      }
+    }
+
     async function loadFleet() {
       try {
         const res = await fetch('/api/fleet');
         const data = await res.json();
         fleetCache = data.vehicles || [];
-        // Load any cached telemetry from file
         for (const v of fleetCache) {
           if (v.last_check && v.last_check.found) {
             telemetryCache[v.vrn] = v.last_check;
@@ -935,6 +1128,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
             <div class="actions-cell">
               <button class="btn btn-secondary btn-sm" onclick="openDetails('${v.vrn}')">Inspect</button>
               <button class="btn btn-secondary btn-sm" onclick="checkPlate('${v.vrn}')">Scan</button>
+              <button class="btn ${v.booked ? 'btn-booked' : 'btn-secondary'} btn-sm" id="book-btn-${v.vrn}" onclick="toggleBooked('${v.vrn}')">${v.booked ? 'Booked ✓' : 'Book MOT'}</button>
               <button class="btn btn-danger btn-sm" onclick="removePlate('${v.vrn}')">✕</button>
             </div>
           </td>
@@ -942,11 +1136,37 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         tbody.appendChild(row);
 
         if (telemetryCache[v.vrn]) {
-          applyTelemetry(v.vrn, telemetryCache[v.vrn]);
+          applyTelemetry(v.vrn, telemetryCache[v.vrn], v.booked);
         }
       }
 
       updateKpis();
+    }
+
+    async function toggleBooked(vrn) {
+      const v = fleetCache.find(x => x.vrn === vrn);
+      if (!v) return;
+      const newStatus = !v.booked;
+      v.booked = newStatus;
+
+      try {
+        await fetch('/api/vehicles/book', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ vrn: vrn, booked: newStatus })
+        });
+        const btn = document.getElementById('book-btn-' + vrn);
+        if (btn) {
+          btn.className = `btn ${newStatus ? 'btn-booked' : 'btn-secondary'} btn-sm`;
+          btn.textContent = newStatus ? 'Booked ✓' : 'Book MOT';
+        }
+        if (telemetryCache[vrn]) {
+          applyTelemetry(vrn, telemetryCache[vrn], newStatus);
+        }
+        updateKpis();
+      } catch (err) {
+        alert('Failed to update booking status: ' + err);
+      }
     }
 
     async function checkPlate(vrn) {
@@ -959,7 +1179,8 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         const res = await fetch('/api/check?vrn=' + encodeURIComponent(vrn));
         const data = await res.json();
         telemetryCache[vrn] = data;
-        applyTelemetry(vrn, data);
+        const v = fleetCache.find(x => x.vrn === vrn);
+        applyTelemetry(vrn, data, v ? v.booked : false);
         updateKpis();
         return data;
       } catch (e) {
@@ -970,7 +1191,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       }
     }
 
-    function applyTelemetry(vrn, data) {
+    function applyTelemetry(vrn, data, isBooked) {
       const makeEl = document.getElementById('make-' + vrn);
       const attrEl = document.getElementById('attr-' + vrn);
       const statusEl = document.getElementById('status-' + vrn);
@@ -985,9 +1206,17 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
 
         let pill = '<span class="pill pill-pos"><span class="pill-dot"></span>Valid</span>';
         if (data.is_mot_expired) {
-          pill = '<span class="pill pill-neg"><span class="pill-dot"></span>Expired</span>';
+          if (isBooked) {
+            pill = '<span class="pill pill-booked"><span class="pill-dot"></span>Booked (Legal to Drive to Test)</span>';
+          } else {
+            pill = '<span class="pill pill-neg"><span class="pill-dot"></span>Expired</span>';
+          }
         } else if (data.days_until_mot !== null && data.days_until_mot <= 30) {
-          pill = `<span class="pill pill-warn"><span class="pill-dot"></span>${data.days_until_mot}d left</span>`;
+          if (isBooked) {
+            pill = `<span class="pill pill-booked"><span class="pill-dot"></span>Booked (${data.days_until_mot}d left)</span>`;
+          } else {
+            pill = `<span class="pill pill-warn"><span class="pill-dot"></span>${data.days_until_mot}d left</span>`;
+          }
         }
         statusEl.innerHTML = pill;
 
@@ -1092,7 +1321,6 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         const trimmed = line.trim();
         if (!trimmed) continue;
         
-        // Match VRN and parse remaining as notes
         const match = trimmed.match(plateRegex);
         if (match) {
           const rawVrn = match[0].replace(/\\s+/g, '').toUpperCase();
@@ -1147,7 +1375,6 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         progFill.style.width = Math.round((count / total) * 100) + '%';
 
         await checkPlate(v.vrn);
-        // Small delay to be respectful of DVLA rate limits
         await new Promise(r => setTimeout(r, 600));
       }
 
