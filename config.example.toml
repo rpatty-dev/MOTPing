@@ -1,0 +1,51 @@
+# MOTPing Configuration
+# Edit with your fleet vehicles, reminder notification thresholds, and alert channels.
+
+[general]
+# Interval in hours between automated background fleet re-scans
+check_interval_hours = 24
+
+[thresholds]
+# Days before MOT expiration to trigger early warning (e.g. 30 days)
+warning_days = 30
+
+# Days before MOT expiration to trigger urgent alert (e.g. 14 days)
+urgent_days = 14
+
+# Days before MOT expiration to trigger critical daily countdown (e.g. 7 days)
+critical_days = 7
+
+[notifications]
+# Delivery channels: choose 'email', 'ntfy', or 'both'
+email_enabled = true
+ntfy_enabled = true
+
+[ntfy]
+# Instant push notifications to iPhone, Android, or Desktop via ntfy (https://ntfy.sh)
+topic = "your-mot-alerts-topic"
+server = "https://ntfy.sh"
+priority = "high"
+
+[smtp]
+# Email alert configuration
+host = "smtp.example.com"
+port = 587
+use_tls = true
+username = "alerts@example.com"
+password = "YOUR_SMTP_PASSWORD"
+from_email = "MOTPing Alerts <alerts@example.com>"
+to_email = "fleet-manager@example.com"
+
+# Monitored License Plates / VRNs
+# Add as many vehicles as you want to track across your fleet or personal garage
+[[vehicles]]
+vrn = "P3 RCV"
+notes = "Executive Mercedes Saloon"
+
+[[vehicles]]
+vrn = "FT24 VAN"
+notes = "Service Transit Van #1"
+
+[[vehicles]]
+vrn = "VX22 FLT"
+notes = "Plumbing Maintenance Unit"

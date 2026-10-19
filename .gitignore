@@ -1,0 +1,13 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# State files & local logs
+*.log
+mot_fleet_state.json
+config.toml
+
+# OS generated
+.DS_Store
+Thumbs.db
