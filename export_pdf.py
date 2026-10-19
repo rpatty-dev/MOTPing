@@ -11,7 +11,7 @@ from datetime import datetime
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "mot_fleet_state.json")
 REPORT_HTML = os.path.join(BASE_DIR, "report_temp.html")
-DESKTOP_PDF = os.path.join(r"C:\Users\ryan.pattison\Desktop", "MOT_Expired_and_Expiring_Report.pdf")
+DESKTOP_PDF = os.path.join(os.path.expanduser("~/Desktop"), "MOT_Expired_and_Expiring_Report.pdf")
 LOCAL_PDF = os.path.join(BASE_DIR, "MOT_Expired_and_Expiring_Report.pdf")
 
 EDGE_PATHS = [

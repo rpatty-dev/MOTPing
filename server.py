@@ -230,9 +230,9 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
             body = self.rfile.read(length).decode('utf-8')
             try:
                 data = json.loads(body) if body else {}
-                excel_path = data.get("path", r"Z:\Vehicles - Plant\vehicles\Vehicles log 19.xlsx")
-                if not os.path.exists(excel_path):
-                    self.send_json({"error": f"File not found: {excel_path}"}, 404)
+                excel_path = data.get("path", "")
+                if not excel_path or not os.path.exists(excel_path):
+                    self.send_json({"error": "Valid file path required."}, 400)
                     return
 
                 extracted = parse_vehicles_from_excel(excel_path)
@@ -890,7 +890,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
       <input type="file" id="fileInput" style="display: none;" accept=".xlsx,.csv,.txt" onchange="handleFileSelect(event)" />
       <div class="drop-zone-text">Drag & Drop Excel or Fleet Logs Here</div>
-      <div class="drop-zone-sub">Drop <code>Vehicles log 19.xlsx</code>, CSV, or text files to automatically intake and track plates</div>
+      <div class="drop-zone-sub">Drop Excel (<code>.xlsx</code>), CSV, or text files to automatically intake and track plates</div>
     </div>
 
     <!-- KPI Metric Strip -->
@@ -984,7 +984,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         </div>
         <button class="btn btn-secondary btn-sm" onclick="closeBulkModal()">✕</button>
       </div>
-      <textarea id="bulkInput" class="textarea-bulk" placeholder="BJ12 XDH, Caolan Ohare&#10;BMZ 2393 - VW Transporter&#10;AFZ 7814&#10;P3 RCV"></textarea>
+      <textarea id="bulkInput" class="textarea-bulk" placeholder="AB12 CDE, Transit Van - Driver A&#10;XY65 FGH, Yard Maintenance&#10;KL18 NOP&#10;P3 RCV"></textarea>
       <div style="display: flex; justify-content: space-between; align-items: center;">
         <span style="font-size: 12px; color: var(--faint);">Accepts comma, tab, dash or line separated formats.</span>
         <div style="display: flex; gap: 8px;">
@@ -1306,8 +1306,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     }
 
     async function syncExcel() {
-      const defaultPath = "Z:\\\\Vehicles - Plant\\\\vehicles\\\\Vehicles log 19.xlsx";
-      const path = prompt("Enter Excel file path to import:", defaultPath);
+      const path = prompt("Enter Excel file path (.xlsx) to import:");
       if (!path) return;
 
       try {
