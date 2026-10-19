@@ -563,7 +563,7 @@
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           Export Expired & Expiring (PDF)
         </button>
-        <button class="btn btn-secondary btn-sm" onclick="syncExcel()">Sync Excel Log</button>
+        <button class="btn btn-secondary btn-sm" onclick="clearFleet()" style="color: var(--muted);" title="Clear current fleet from your browser">Clear Fleet</button>
         <button class="btn btn-secondary btn-sm" onclick="openBulkModal()">Paste Bulk Plates</button>
         <button class="btn btn-primary btn-sm" id="btnScanAll" onclick="scanAllLive()">Scan All Expiries</button>
       </div>
@@ -1074,27 +1074,12 @@
       } catch (err) {}
     }
 
-    async function syncExcel() {
-      const defaultPath = "Z:\\\\Vehicles - Plant\\\\vehicles\\\\Vehicles log 19.xlsx";
-      const path = prompt("Enter Excel file path to import:", defaultPath);
-      if (!path) return;
-
-      try {
-        const res = await fetch('/api/import-excel', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ path: path })
-        });
-        const data = await res.json();
-        if (data.success) {
-          alert(`Successfully imported from Excel!\nFound: ${data.parsed} vehicles\nNew additions: ${data.added}\nTotal in Fleet: ${data.total}`);
-          loadFleet();
-        } else {
-          alert('Import failed: ' + (data.error || 'Unknown error'));
-        }
-      } catch (e) {
-        alert('Network or server error while syncing Excel: ' + e);
-      }
+    function clearFleet() {
+      if (!confirm("Clear your vehicle watchlist from this browser? (This will not affect other users)")) return;
+      fleetCache = [];
+      telemetryCache = {};
+      saveLocalFleet();
+      renderFleet();
     }
 
     function openBulkModal() {
