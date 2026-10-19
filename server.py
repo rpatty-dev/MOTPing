@@ -15,10 +15,54 @@ import urllib.parse
 import json
 import os
 import sys
+import zipfile
+import xml.etree.ElementTree as ET
+import re
 from mot_engine import query_dvla_vehicle
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "mot_fleet_state.json")
+
+def parse_vehicles_from_excel(path):
+    if not os.path.exists(path):
+        return []
+    try:
+        with zipfile.ZipFile(path, 'r') as z:
+            shared = []
+            if 'xl/sharedStrings.xml' in z.namelist():
+                tree = ET.fromstring(z.read('xl/sharedStrings.xml'))
+                for si in tree.findall('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}si'):
+                    t = si.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t')
+                    shared.append(t.text if t is not None and t.text else '')
+
+            tree = ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
+            rows = tree.findall('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheetData/{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row')
+            
+            seen = set()
+            vehicles = []
+            for r in rows[1:]:
+                cells = {}
+                for c in r.findall('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c'):
+                    ref = c.attrib.get('r', '')
+                    col = re.sub(r'[0-9]', '', ref)
+                    v = c.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v')
+                    t = c.attrib.get('t')
+                    val = ''
+                    if v is not None and v.text:
+                        val = shared[int(v.text)] if t == 's' else v.text
+                    cells[col] = val.strip()
+                vehicle = cells.get('A', '')
+                reg = cells.get('B', '').replace(' ', '').upper()
+                driver = cells.get('F', '')
+                comment = cells.get('K', '')
+                if reg and len(reg) >= 4 and not reg.startswith('REG') and reg not in seen:
+                    seen.add(reg)
+                    notes_parts = [p for p in [vehicle, driver, comment] if p]
+                    vehicles.append({'vrn': reg, 'notes': ' | '.join(notes_parts), 'last_check': None})
+            return vehicles
+    except Exception as e:
+        print(f"Error parsing excel: {e}")
+        return []
 
 def load_fleet_state():
     if os.path.exists(STATE_FILE):
@@ -97,29 +141,80 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/api/vehicles":
+        path = parsed.path
+
+        # 1. Single or Batch Vehicle Add
+        if path == "/api/vehicles":
             length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(length).decode('utf-8')
             try:
                 data = json.loads(body)
-                vrn = data.get("vrn", "").replace(" ", "").upper()
-                notes = data.get("notes", "")
-                if not vrn:
-                    self.send_json({"error": "VRN is required"}, 400)
+                items = data.get("vehicles") if isinstance(data, dict) and "vehicles" in data else ([data] if isinstance(data, dict) else data)
+                state = load_fleet_state()
+                existing_map = {v["vrn"]: v for v in state.get("vehicles", [])}
+                added_count = 0
+                updated_count = 0
+
+                for item in items:
+                    raw_vrn = item.get("vrn") or item.get("reg") or ""
+                    vrn = re.sub(r'[^A-Za-z0-9]', '', raw_vrn).upper()
+                    notes = item.get("notes") or ""
+                    if not vrn:
+                        continue
+                    if vrn in existing_map:
+                        if notes:
+                            existing_map[vrn]["notes"] = notes
+                        updated_count += 1
+                    else:
+                        new_veh = {"vrn": vrn, "notes": notes, "last_check": None}
+                        state.setdefault("vehicles", []).append(new_veh)
+                        existing_map[vrn] = new_veh
+                        added_count += 1
+
+                save_fleet_state(state)
+                self.send_json({
+                    "success": True,
+                    "added": added_count,
+                    "updated": updated_count,
+                    "total": len(state.get("vehicles", []))
+                })
+            except Exception as e:
+                self.send_json({"error": str(e)}, 500)
+            return
+
+        # 2. Import Directly from Local Excel Path
+        if path == "/api/import-excel":
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length).decode('utf-8')
+            try:
+                data = json.loads(body) if body else {}
+                excel_path = data.get("path", r"Z:\Vehicles - Plant\vehicles\Vehicles log 19.xlsx")
+                if not os.path.exists(excel_path):
+                    self.send_json({"error": f"File not found: {excel_path}"}, 404)
                     return
 
+                extracted = parse_vehicles_from_excel(excel_path)
                 state = load_fleet_state()
-                existing = [v for v in state.get("vehicles", []) if v["vrn"] == vrn]
-                if existing:
-                    existing[0]["notes"] = notes
-                else:
-                    state.setdefault("vehicles", []).append({
-                        "vrn": vrn,
-                        "notes": notes,
-                        "last_check": None
-                    })
+                existing_map = {v["vrn"]: v for v in state.get("vehicles", [])}
+                added = 0
+                for item in extracted:
+                    vrn = item["vrn"]
+                    if vrn in existing_map:
+                        if item["notes"]:
+                            existing_map[vrn]["notes"] = item["notes"]
+                    else:
+                        state.setdefault("vehicles", []).append(item)
+                        existing_map[vrn] = item
+                        added += 1
+
                 save_fleet_state(state)
-                self.send_json({"success": True, "message": f"Vehicle {vrn} added to watchlist."})
+                self.send_json({
+                    "success": True,
+                    "parsed": len(extracted),
+                    "added": added,
+                    "total": len(state.get("vehicles", [])),
+                    "path": excel_path
+                })
             except Exception as e:
                 self.send_json({"error": str(e)}, 500)
             return
@@ -131,7 +226,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/vehicles":
             params = urllib.parse.parse_qs(parsed.query)
-            vrn = params.get("vrn", [""])[0].replace(" ", "").upper()
+            vrn = re.sub(r'[^A-Za-z0-9]', '', params.get("vrn", [""])[0]).upper()
             state = load_fleet_state()
             state["vehicles"] = [v for v in state.get("vehicles", []) if v["vrn"] != vrn]
             save_fleet_state(state)
@@ -158,7 +253,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
   <title>MOTPing — Fleet MOT & Tax Telemetry</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
       --ground: #000000;
@@ -203,7 +298,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
 
     /* Shell Layout */
     .shell {
-      max-width: 1240px;
+      max-width: 1280px;
       margin: 0 auto;
       padding: 32px 24px 64px;
     }
@@ -229,10 +324,10 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     .header-actions {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
     }
 
-    /* KPI Summary Strip (Taste Skill: single container split by 1px dividers, no icon boxes) */
+    /* KPI Summary Strip */
     .kpi-strip {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -249,10 +344,10 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       border-left: 1px solid var(--border);
     }
     .kpi-label {
-      font-size: 12px;
-      font-weight: 500;
+      font-size: 11px;
+      font-weight: 600;
       color: var(--muted);
-      letter-spacing: 0.02em;
+      letter-spacing: 0.04em;
       text-transform: uppercase;
     }
     .kpi-value {
@@ -271,7 +366,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       margin-top: 4px;
     }
 
-    /* Quick Intake / Plate Watch Panel */
+    /* Panels */
     .panel {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -318,7 +413,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     .input-plate {
       font-family: var(--mono);
       font-size: 15px;
-      font-weight: 700;
+      font-weight: 800;
       text-transform: uppercase;
       letter-spacing: 1.5px;
       background: #fef08a;
@@ -334,8 +429,8 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       align-items: center;
       justify-content: center;
       gap: 8px;
-      height: 42px;
-      padding: 0 18px;
+      height: 40px;
+      padding: 0 16px;
       border-radius: 8px;
       font-family: var(--font);
       font-size: 13px;
@@ -411,7 +506,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       white-space: nowrap;
     }
     td {
-      padding: 16px 18px;
+      padding: 14px 18px;
       border-bottom: 1px solid var(--rule);
       vertical-align: middle;
       font-size: 13.5px;
@@ -423,30 +518,22 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       background: rgba(255, 255, 255, 0.015);
     }
 
-    /* UK Registration Plate Badge */
+    /* Clean Yellow Number Plate Badge (NO GB) */
     .uk-plate {
       display: inline-flex;
       align-items: center;
-      background: #fef08a;
+      justify-content: center;
+      background: #facc15;
       color: #111827;
       font-family: var(--mono);
-      font-weight: 700;
-      font-size: 13px;
-      letter-spacing: 1px;
-      padding: 2px 8px;
+      font-weight: 800;
+      font-size: 13.5px;
+      letter-spacing: 1.2px;
+      padding: 3px 10px;
       border-radius: 4px;
-      border: 1px solid #eab308;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.2);
-    }
-    .uk-plate-gb {
-      background: #1e3a8a;
-      color: #ffffff;
-      font-size: 9px;
-      font-weight: 700;
-      padding: 2px 4px;
-      border-radius: 2px 0 0 2px;
-      margin: -2px 6px -2px -8px;
-      letter-spacing: 0;
+      border: 1px solid #ca8a04;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.35);
+      text-transform: uppercase;
     }
 
     /* Status Pills */
@@ -504,11 +591,11 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       gap: 8px;
     }
 
-    /* Modal / Detail Drawer */
-    .drawer-overlay {
+    /* Modal / Detail Drawer & Bulk Import */
+    .modal-overlay {
       position: fixed;
       inset: 0;
-      background: rgba(0, 0, 0, 0.75);
+      background: rgba(0, 0, 0, 0.78);
       backdrop-filter: blur(4px);
       z-index: 100;
       display: none;
@@ -516,19 +603,19 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       justify-content: center;
       padding: 20px;
     }
-    .drawer-overlay.active {
+    .modal-overlay.active {
       display: flex;
     }
-    .drawer-card {
+    .modal-card {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 16px;
       width: 100%;
-      max-width: 580px;
+      max-width: 620px;
       padding: 24px;
-      box-shadow: 0 20px 40px rgba(0,0,0,0.8);
+      box-shadow: 0 20px 40px rgba(0,0,0,0.85);
     }
-    .drawer-header {
+    .modal-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -539,7 +626,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     .spec-grid {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
-      gap: 16px;
+      gap: 14px;
       margin-bottom: 20px;
     }
     .spec-item {
@@ -555,10 +642,44 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       font-weight: 600;
     }
     .spec-item-val {
-      font-size: 15px;
+      font-size: 14.5px;
       font-weight: 600;
       margin-top: 4px;
       color: var(--text);
+    }
+
+    .textarea-bulk {
+      width: 100%;
+      height: 180px;
+      background: var(--ground);
+      border: 1px solid var(--control);
+      border-radius: 8px;
+      padding: 12px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      resize: vertical;
+      outline: none;
+      margin-bottom: 16px;
+      line-height: 1.6;
+    }
+    .textarea-bulk:focus {
+      border-color: #ffffff;
+    }
+
+    .progress-bar-wrap {
+      background: var(--ground);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      height: 8px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    .progress-fill {
+      background: var(--accent);
+      height: 100%;
+      width: 0%;
+      transition: width 0.2s ease;
     }
 
     @media (max-width: 860px) {
@@ -592,8 +713,9 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         <img src="/logo.svg" alt="MOTPing" class="logo-img" />
       </div>
       <div class="header-actions">
-        <span class="pill pill-neutral"><span class="pill-dot" style="background:#10b981;"></span>DVLA Direct Engine</span>
-        <button class="btn btn-secondary btn-sm" onclick="refreshAll()">Refresh All</button>
+        <button class="btn btn-secondary btn-sm" onclick="syncExcel()">Sync Excel Log</button>
+        <button class="btn btn-secondary btn-sm" onclick="openBulkModal()">Paste Bulk Plates</button>
+        <button class="btn btn-primary btn-sm" id="btnScanAll" onclick="scanAllLive()">Scan All Expiries</button>
       </div>
     </header>
 
@@ -621,17 +743,28 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       </div>
     </section>
 
+    <!-- Scan Progress (hidden by default) -->
+    <div id="scanProgressCard" style="display: none; margin-bottom: 24px;" class="panel">
+      <div style="display: flex; justify-content: space-between; align-items: baseline;">
+        <span style="font-weight: 600;" id="scanProgressText">Scanning DVLA telemetry...</span>
+        <span style="font-size: 12px; color: var(--muted);" id="scanProgressCount">0 / 0</span>
+      </div>
+      <div class="progress-bar-wrap">
+        <div class="progress-fill" id="scanProgressFill"></div>
+      </div>
+    </div>
+
     <!-- Plate Intake Panel -->
     <section class="panel">
       <div class="panel-header">
         <div>
           <h2 class="panel-title">Add Vehicle to Watchlist</h2>
-          <p class="panel-desc">Automatic background query against DVLA vehicle & test certificate records.</p>
+          <p class="panel-desc">Automatic query against DVLA vehicle & test certificate records.</p>
         </div>
       </div>
       <form class="intake-row" onsubmit="addVehicle(event)">
-        <input type="text" id="vrnInput" class="input input-plate" placeholder="REG PLATE" maxlength="9" autocomplete="off" required />
-        <input type="text" id="notesInput" class="input" placeholder="Notes (e.g. Mercedes Saloon / Fleet #04)" />
+        <input type="text" id="vrnInput" class="input input-plate" placeholder="REG PLATE" maxlength="10" autocomplete="off" required />
+        <input type="text" id="notesInput" class="input" placeholder="Notes (e.g. Ford Transit • Driver Name • Fleet #04)" />
         <button type="submit" class="btn btn-primary">+ Track Plate</button>
       </form>
     </section>
@@ -655,7 +788,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
               <th>MOT Status</th>
               <th>MOT Expiry</th>
               <th>Road Tax</th>
-              <th>Notes / Assignee</th>
+              <th>Notes / Driver</th>
               <th style="text-align: right;">Action</th>
             </tr>
           </thead>
@@ -667,15 +800,36 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
     </section>
   </div>
 
-  <!-- Telemetry Detail Drawer / Modal -->
-  <div class="drawer-overlay" id="detailDrawer" onclick="closeDrawer(event)">
-    <div class="drawer-card" onclick="event.stopPropagation()">
-      <div class="drawer-header">
+  <!-- Bulk Paste Modal -->
+  <div class="modal-overlay" id="bulkModal" onclick="closeBulkModal(event)">
+    <div class="modal-card" onclick="event.stopPropagation()">
+      <div class="modal-header">
         <div>
-          <span class="uk-plate" id="drawerVrn"><span class="uk-plate-gb">GB</span>REG</span>
+          <h3 style="font-size: 17px; font-weight: 600;">Paste Vehicle List</h3>
+          <p style="font-size: 13px; color: var(--muted); margin-top: 4px;">Paste raw registration plates or lines with notes (e.g. from Excel, CSV, or WhatsApp).</p>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="closeBulkModal()">✕</button>
+      </div>
+      <textarea id="bulkInput" class="textarea-bulk" placeholder="BJ12 XDH, Caolan Ohare&#10;BMZ 2393 - VW Transporter&#10;AFZ 7814&#10;P3 RCV"></textarea>
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <span style="font-size: 12px; color: var(--faint);">Accepts comma, tab, dash or line separated formats.</span>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn btn-secondary btn-sm" onclick="closeBulkModal()">Cancel</button>
+          <button class="btn btn-primary btn-sm" onclick="submitBulkPlates()">Import Plates</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Telemetry Detail Drawer / Modal -->
+  <div class="modal-overlay" id="detailDrawer" onclick="closeDrawer(event)">
+    <div class="modal-card" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div>
+          <span class="uk-plate" id="drawerVrn">REG</span>
           <h3 style="font-size: 17px; font-weight: 600; margin-top: 8px;" id="drawerTitle">Vehicle Telemetry</h3>
         </div>
-        <button class="btn btn-secondary btn-sm" onclick="closeDrawer()">Close</button>
+        <button class="btn btn-secondary btn-sm" onclick="closeDrawer()">✕</button>
       </div>
       <div class="spec-grid">
         <div class="spec-item">
@@ -720,12 +874,19 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
   <script>
     let fleetCache = [];
     let telemetryCache = {};
+    let isScanningAll = false;
 
     async function loadFleet() {
       try {
         const res = await fetch('/api/fleet');
         const data = await res.json();
         fleetCache = data.vehicles || [];
+        // Load any cached telemetry from file
+        for (const v of fleetCache) {
+          if (v.last_check && v.last_check.found) {
+            telemetryCache[v.vrn] = v.last_check;
+          }
+        }
         renderFleet();
       } catch (e) {
         document.getElementById('fleetBody').innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--negative); padding: 24px;">Failed to load fleet registry.</td></tr>';
@@ -758,16 +919,16 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         
         row.innerHTML = `
           <td>
-            <span class="uk-plate"><span class="uk-plate-gb">GB</span>${v.vrn}</span>
+            <span class="uk-plate">${v.vrn}</span>
           </td>
           <td id="spec-${v.vrn}">
             <div class="vehicle-spec">
-              <span class="spec-primary" id="make-${v.vrn}">Scanning...</span>
-              <span class="spec-secondary" id="attr-${v.vrn}">Connecting to DVLA</span>
+              <span class="spec-primary" id="make-${v.vrn}">Queued...</span>
+              <span class="spec-secondary" id="attr-${v.vrn}">Ready for scan</span>
             </div>
           </td>
           <td id="status-${v.vrn}">
-            <span class="pill pill-neutral"><span class="pill-dot"></span>Checking</span>
+            <span class="pill pill-neutral"><span class="pill-dot"></span>Idle</span>
           </td>
           <td id="mot-${v.vrn}" class="num" style="font-weight: 600;">-</td>
           <td id="tax-${v.vrn}" class="num">-</td>
@@ -776,7 +937,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
             <div class="actions-cell">
               <button class="btn btn-secondary btn-sm" onclick="openDetails('${v.vrn}')">Inspect</button>
               <button class="btn btn-secondary btn-sm" onclick="checkPlate('${v.vrn}')">Scan</button>
-              <button class="btn btn-danger btn-sm" onclick="removePlate('${v.vrn}')">Remove</button>
+              <button class="btn btn-danger btn-sm" onclick="removePlate('${v.vrn}')">✕</button>
             </div>
           </td>
         `;
@@ -784,8 +945,6 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
 
         if (telemetryCache[v.vrn]) {
           applyTelemetry(v.vrn, telemetryCache[v.vrn]);
-        } else {
-          checkPlate(v.vrn);
         }
       }
 
@@ -804,10 +963,12 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
         telemetryCache[vrn] = data;
         applyTelemetry(vrn, data);
         updateKpis();
+        return data;
       } catch (e) {
         if (statusEl) {
           statusEl.innerHTML = '<span class="pill pill-neg"><span class="pill-dot"></span>Error</span>';
         }
+        return null;
       }
     }
 
@@ -879,7 +1040,8 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       });
       document.getElementById('vrnInput').value = '';
       document.getElementById('notesInput').value = '';
-      loadFleet();
+      await loadFleet();
+      checkPlate(vrn.replace(/\\s+/g, '').toUpperCase());
     }
 
     async function removePlate(vrn) {
@@ -889,14 +1051,120 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
       loadFleet();
     }
 
-    function refreshAll() {
-      telemetryCache = {};
-      loadFleet();
+    async function syncExcel() {
+      const defaultPath = "Z:\\\\Vehicles - Plant\\\\vehicles\\\\Vehicles log 19.xlsx";
+      const path = prompt("Enter Excel file path to import:", defaultPath);
+      if (!path) return;
+
+      try {
+        const res = await fetch('/api/import-excel', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ path: path.replace(/\\\\/g, '\\') })
+        });
+        const data = await res.json();
+        if (data.success) {
+          alert(`Successfully imported from Excel!\nFound: ${data.parsed} vehicles\nNew additions: ${data.added}\nTotal in Fleet: ${data.total}`);
+          loadFleet();
+        } else {
+          alert('Import failed: ' + (data.error || 'Unknown error'));
+        }
+      } catch (e) {
+        alert('Network or server error while syncing Excel: ' + e);
+      }
+    }
+
+    function openBulkModal() {
+      document.getElementById('bulkModal').classList.add('active');
+    }
+
+    function closeBulkModal() {
+      document.getElementById('bulkModal').classList.remove('active');
+    }
+
+    async function submitBulkPlates() {
+      const text = document.getElementById('bulkInput').value;
+      if (!text.trim()) return;
+
+      const lines = text.split(/\\r?\\n/);
+      const vehicles = [];
+      const plateRegex = /([A-Za-z]{1,3}[0-9]{1,4}[A-Za-z]{0,3}|[A-Za-z]{2}[0-9]{2}\\s?[A-Za-z]{3})/i;
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        
+        // Match VRN and parse remaining as notes
+        const match = trimmed.match(plateRegex);
+        if (match) {
+          const rawVrn = match[0].replace(/\\s+/g, '').toUpperCase();
+          const notes = trimmed.replace(match[0], '').replace(/^[,\\-\\t\\s|]+|[,\\-\\t\\s|]+$/g, '').trim();
+          vehicles.push({ vrn: rawVrn, notes: notes });
+        }
+      }
+
+      if (vehicles.length === 0) {
+        alert("No valid UK registration plates found in pasted text.");
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/vehicles', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ vehicles: vehicles })
+        });
+        const data = await res.json();
+        alert(`Bulk Import Complete!\nAdded: ${data.added}\nUpdated: ${data.updated}\nTotal Fleet: ${data.total}`);
+        closeBulkModal();
+        document.getElementById('bulkInput').value = '';
+        loadFleet();
+      } catch (e) {
+        alert('Error submitting bulk plates: ' + e);
+      }
+    }
+
+    async function scanAllLive() {
+      if (isScanningAll) return;
+      isScanningAll = true;
+
+      const btn = document.getElementById('btnScanAll');
+      btn.disabled = true;
+      btn.textContent = 'Scanning Fleet...';
+
+      const progCard = document.getElementById('scanProgressCard');
+      const progText = document.getElementById('scanProgressText');
+      const progCount = document.getElementById('scanProgressCount');
+      const progFill = document.getElementById('scanProgressFill');
+
+      progCard.style.display = 'block';
+
+      const total = fleetCache.length;
+      let count = 0;
+
+      for (const v of fleetCache) {
+        count++;
+        progText.textContent = `Scanning ${v.vrn} (${count} of ${total})...`;
+        progCount.textContent = `${count} / ${total}`;
+        progFill.style.width = Math.round((count / total) * 100) + '%';
+
+        await checkPlate(v.vrn);
+        // Small delay to be respectful of DVLA rate limits
+        await new Promise(r => setTimeout(r, 600));
+      }
+
+      progText.textContent = 'Fleet Telemetry Scan Complete!';
+      setTimeout(() => {
+        progCard.style.display = 'none';
+        btn.disabled = false;
+        btn.textContent = 'Scan All Expiries';
+        isScanningAll = false;
+      }, 2500);
     }
 
     function openDetails(vrn) {
       const data = telemetryCache[vrn] || {};
-      document.getElementById('drawerVrn').innerHTML = `<span class="uk-plate-gb">GB</span>${vrn}`;
+      document.getElementById('drawerVrn').textContent = vrn;
       document.getElementById('drawerTitle').textContent = data.make || 'Vehicle Telemetry';
       document.getElementById('specMake').textContent = data.make || 'Unknown';
       document.getElementById('specYear').textContent = data.year || 'Unknown';
@@ -919,6 +1187,7 @@ class MOTPingHandler(http.server.BaseHTTPRequestHandler):
 </body>
 </html>
 """
+
         body = html.encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
