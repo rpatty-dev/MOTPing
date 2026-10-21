@@ -193,3 +193,7 @@ python mot_monitor.py
 ## 📄 License
 
 Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
+
+---
+
+Built with help from [Nitech](https://nitech.dev).
